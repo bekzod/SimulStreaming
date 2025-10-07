@@ -4,11 +4,35 @@ import argparse
 import sys
 import logging
 import torch
+from types import SimpleNamespace
 
 from simul_whisper.config import AlignAttConfig
 from simul_whisper.simul_whisper import PaddedAlignAttWhisper
+from simul_whisper.whisper.tokenizer import TO_LANGUAGE_CODE
 
 logger = logging.getLogger(__name__)
+
+
+class _TokenizerPromptProcessor:
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
+
+    def get_decoder_prompt_ids(self, language: str, task: str):
+        language_normalized = (language or "").lower()
+        language_code = TO_LANGUAGE_CODE.get(language_normalized, language_normalized)
+        tokens = [self._tokenizer.sot]
+
+        if language_code and language_code not in ("auto", None):
+            try:
+                tokens.append(self._tokenizer.to_language_token(language_code))
+            except (KeyError, ValueError):
+                logger.warning(f"Unable to set language token for '{language}'. Forcing language skipped.")
+
+        task_token = self._tokenizer.translate if task == "translate" else self._tokenizer.transcribe
+        tokens.append(task_token)
+        tokens.append(self._tokenizer.no_timestamps)
+
+        return [[idx, token_id] for idx, token_id in enumerate(tokens)]
 
 def simulwhisper_args(parser):
     group = parser.add_argument_group('Whisper arguments')
@@ -111,6 +135,18 @@ class SimulWhisperASR(ASRBase):
         )
         logger.info(f"Language: {language}")
         self.model = PaddedAlignAttWhisper(cfg)
+        processor = _TokenizerPromptProcessor(self.model.tokenizer)
+        backend_model = getattr(self.model, "model", None)
+        if backend_model is not None:
+            config = getattr(backend_model, "config", None)
+            if config is None:
+                config = SimpleNamespace()
+                backend_model.config = config
+            backend_model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(
+                language="uzbek",
+                task="transcribe",
+            )
+            logger.info("Forced decoder IDs set to Uzbek for streaming decoder.")
 
     def transcribe(self, audio, init_prompt=""):
         logger.info("SimulWhisperASR's transcribe() should not be used. It's here only temporarily." \
