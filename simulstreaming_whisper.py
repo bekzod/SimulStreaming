@@ -45,6 +45,28 @@ def simulwhisper_args(parser):
     group.add_argument("--kenlm_path", type=str, default=None, help="Path to KenLM .arpa or binary model for shallow fusion (beam only)")
     group.add_argument("--lm_weight", type=float, default=0.0, help="LM shallow fusion weight; 0 disables")
     group.add_argument("--lm_lowercase", action=argparse.BooleanOptionalAction, default=False, help="Lowercase text before LM scoring")
+    group.add_argument("--lm_length_weight", type=float, default=0.0, help="Length-normalization weight β")
+    group.add_argument("--lm_length_exponent", type=float, default=1.0, help="Exponent used for length normalization (default 1.0)")
+    group.add_argument(
+        "--lm_token_mode",
+        type=str,
+        choices=("auto", "word", "subword"),
+        default="auto",
+        help="How to tokenize text for KenLM scoring",
+    )
+    group.add_argument(
+        "--lm_fusion_mode",
+        type=str,
+        choices=("online", "rescore", "both"),
+        default="online",
+        help="Apply LM during beam search (online), only for rescoring, or both",
+    )
+    group.add_argument(
+        "--lm_cache_size",
+        type=int,
+        default=8192,
+        help="Max cached KenLM prefix states for incremental scoring",
+    )
 
     group = parser.add_argument_group('Audio buffer')
     group.add_argument('--audio_max_len', type=float, default=30.0, 
@@ -96,7 +118,9 @@ def simul_asr_factory(args):
     
     a = { v:getattr(args, v) for v in ["model_path", "cif_ckpt_path", "frame_threshold", "audio_min_len", "audio_max_len", "beams", "task",
                                        "never_fire", 'init_prompt', 'static_init_prompt', 'max_context_tokens', "logdir",
-                                       "kenlm_path", "lm_weight", "lm_lowercase"
+                                       "kenlm_path", "lm_weight", "lm_lowercase",
+                                       "lm_length_weight", "lm_length_exponent", "lm_token_mode",
+                                       "lm_fusion_mode", "lm_cache_size"
                                        ]}
     a["language"] = args.lan
     a["segment_length"] = args.min_chunk_size
@@ -115,7 +139,10 @@ class SimulWhisperASR(ASRBase):
     sep = " "
 
     def __init__(self, language, model_path, cif_ckpt_path, frame_threshold, audio_max_len, audio_min_len, segment_length, beams, task, 
-                 decoder_type, never_fire, init_prompt, static_init_prompt, max_context_tokens, logdir):
+                 decoder_type, never_fire, init_prompt, static_init_prompt, max_context_tokens, logdir,
+                 kenlm_path=None, lm_weight=0.0, lm_lowercase=False,
+                 lm_length_weight=0.0, lm_length_exponent=1.0,
+                 lm_token_mode="auto", lm_fusion_mode="online", lm_cache_size=8192):
         cfg = AlignAttConfig(
             model_path=model_path, 
             segment_length=segment_length,
@@ -132,6 +159,14 @@ class SimulWhisperASR(ASRBase):
             max_context_tokens=max_context_tokens,
             static_init_prompt=static_init_prompt,
             logdir=logdir,
+            kenlm_path=kenlm_path,
+            lm_weight=lm_weight,
+            lm_lowercase=lm_lowercase,
+            lm_length_weight=lm_length_weight,
+            lm_length_exponent=lm_length_exponent,
+            lm_token_mode=lm_token_mode,
+            lm_fusion_mode=lm_fusion_mode,
+            lm_cache_size=lm_cache_size,
         )
         logger.info(f"Language: {language}")
         self.model = PaddedAlignAttWhisper(cfg)

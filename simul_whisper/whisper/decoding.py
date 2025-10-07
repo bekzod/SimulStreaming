@@ -299,6 +299,18 @@ class GreedyDecoder(TokenDecoder):
         return tokens, sum_logprobs.tolist()
 
 
+@dataclass
+class BeamCandidate:
+    sequence: Tuple[int, ...]
+    acoustic_score: float
+    lm_logprob: float
+    length_norm: float
+    search_score: float
+    fused_score: float
+    source_index: int
+    lm_entry: Optional[object] = None
+
+
 class BeamSearchDecoder(TokenDecoder):
     def __init__(
         self,
@@ -310,17 +322,30 @@ class BeamSearchDecoder(TokenDecoder):
         lm_scorer: Optional[object] = None,
         lm_weight: float = 0.0,
         decode_tokens_to_text=None,
+        *,
+        length_weight: float = 0.0,
+        length_exponent: float = 1.0,
+        fusion_mode: str = "online",
     ):
         self.beam_size = beam_size
         self.eot = eot
         self.inference = inference
         self.patience = patience or 1.0
         self.max_candidates: int = round(beam_size * self.patience)
-        self.finished_sequences = None
+        self.finished_sequences: Optional[List[Dict[Tuple[int, ...], BeamCandidate]]] = (
+            None
+        )
         # LM fusion
         self.lm_scorer = lm_scorer
         self.lm_weight = lm_weight or 0.0
         self.decode_tokens_to_text = decode_tokens_to_text
+        self.length_weight = length_weight or 0.0
+        self.length_exponent = max(0.0, length_exponent)
+        if fusion_mode not in {"online", "rescore", "both"}:
+            raise ValueError(f"Unsupported fusion_mode '{fusion_mode}'")
+        self.lm_fusion_mode = fusion_mode
+        self._lm_entries: Optional[List[object]] = None
+        self._prompt_lengths: Optional[List[int]] = None
 
         assert (
             self.max_candidates > 0
@@ -328,6 +353,8 @@ class BeamSearchDecoder(TokenDecoder):
 
     def reset(self):
         self.finished_sequences = None
+        self._lm_entries = None
+        self._prompt_lengths = None
 
     def update(
         self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor
@@ -336,65 +363,194 @@ class BeamSearchDecoder(TokenDecoder):
             raise ValueError(f"{tokens.shape}[0] % {self.beam_size} != 0")
 
         n_audio = tokens.shape[0] // self.beam_size
-        if self.finished_sequences is None:  # for the first update
+        if self.finished_sequences is None:  # first update
             self.finished_sequences = [{} for _ in range(n_audio)]
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
-        next_tokens, source_indices, finished_sequences = [], [], []
-        for i in range(n_audio):
-            scores, sources, finished = {}, {}, {}
 
-            # STEP 1: calculate the cumulative log probabilities for possible candidates
+        current_sequences: List[Tuple[int, ...]] = [
+            tuple(row.tolist()) for row in tokens
+        ]
+
+        if self.lm_scorer is not None:
+            if self._lm_entries is None or len(self._lm_entries) != len(
+                current_sequences
+            ):
+                self._lm_entries = []
+                for seq in current_sequences:
+                    text = (
+                        self.decode_tokens_to_text(list(seq))
+                        if self.decode_tokens_to_text is not None
+                        else ""
+                    )
+                    entry = self.lm_scorer.start_entry(seq, text, accumulate=False)
+                    self._lm_entries.append(entry)
+
+        use_lm_online = (
+            self.lm_scorer is not None
+            and self.lm_weight > 0.0
+            and self.lm_fusion_mode in {"online", "both"}
+        )
+        include_lm_final = (
+            self.lm_scorer is not None
+            and self.lm_weight > 0.0
+            and self.lm_fusion_mode in {"online", "both", "rescore"}
+        )
+
+        if self._prompt_lengths is None:
+            self._prompt_lengths = [tokens.shape[1] for _ in range(n_audio)]
+
+        candidates_per_audio: List[List[BeamCandidate]] = [[] for _ in range(n_audio)]
+        selected_per_audio: List[List[BeamCandidate]] = []
+        next_tokens: List[Tuple[int, ...]] = []
+        next_acoustic: List[float] = []
+        source_indices: List[int] = []
+
+        for i in range(n_audio):
             for j in range(self.beam_size):
                 idx = i * self.beam_size + j
                 prefix = tokens[idx].tolist()
-                for logprob, token in zip(*logprobs[idx].topk(self.beam_size + 1)):
+                prefix_entry = (
+                    self._lm_entries[idx] if self._lm_entries is not None else None
+                )
+                topk = logprobs[idx].topk(self.beam_size + 1)
+
+                for logprob, token in zip(topk.values, topk.indices):
+                    tok = token.item()
+                    new_sequence = tuple(prefix + [tok])
                     acoustic = (sum_logprobs[idx] + logprob).item()
-                    sequence = tuple(prefix + [token.item()])
-                    fused = acoustic
-                    # optional LM shallow fusion on the candidate
-                    if self.lm_scorer is not None and self.lm_weight > 0.0 and self.decode_tokens_to_text is not None:
-                        try:
-                            text = self.decode_tokens_to_text(list(sequence))
-                            lm = self.lm_scorer.score_text(text, add_bos=True, add_eos=False)
-                            fused = acoustic + self.lm_weight * lm
-                        except Exception:
-                            # be robust; fall back to acoustic only if LM scoring fails
-                            fused = acoustic
-                    scores[sequence] = fused
-                    sources[sequence] = idx
+                    length_norm = self._length_norm(len(new_sequence), i)
 
-            # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
-            saved = 0
-            for sequence in sorted(scores, key=scores.get, reverse=True):
-                if sequence[-1] == self.eot:
-                    finished[sequence] = scores[sequence]
-                else:
-                    # keep acoustic-only cumulative for future acoustic accumulation
-                    sum_logprobs[len(next_tokens)] = acoustic
-                    next_tokens.append(sequence)
-                    source_indices.append(sources[sequence])
+                    entry = prefix_entry
+                    lm_logprob = 0.0
+                    if self.lm_scorer is not None and prefix_entry is not None:
+                        decoded = (
+                            self.decode_tokens_to_text(list(new_sequence))
+                            if self.decode_tokens_to_text is not None
+                            else ""
+                        )
+                        entry = self.lm_scorer.extend_entry(
+                            prefix_entry,
+                            new_sequence,
+                            decoded,
+                            accumulate=True,
+                            force_flush=False,
+                        )
+                        lm_logprob = entry.log_prob
 
-                    saved += 1
-                    if saved == self.beam_size:
-                        break
+                    search_score = self._compose_total(
+                        acoustic,
+                        lm_logprob,
+                        length_norm,
+                        include_lm=use_lm_online,
+                    )
+                    fused_score = self._compose_total(
+                        acoustic,
+                        lm_logprob,
+                        length_norm,
+                        include_lm=use_lm_online or self.lm_fusion_mode == "both",
+                    )
 
-            finished_sequences.append(finished)
+                    if tok == self.eot:
+                        finished_entry = entry
+                        finished_lm_logprob = lm_logprob
+                        if self.lm_scorer is not None and entry is not None:
+                            finished_entry = self.lm_scorer.finalize_entry(entry)
+                            finished_lm_logprob = finished_entry.log_prob
+                        candidate = BeamCandidate(
+                            sequence=new_sequence,
+                            acoustic_score=acoustic,
+                            lm_logprob=finished_lm_logprob,
+                            length_norm=length_norm,
+                            search_score=search_score,
+                            fused_score=self._compose_total(
+                                acoustic,
+                                finished_lm_logprob,
+                                length_norm,
+                                include_lm=include_lm_final,
+                            ),
+                            source_index=idx,
+                            lm_entry=finished_entry,
+                        )
+                        self._insert_finished(i, candidate)
+                    else:
+                        candidate = BeamCandidate(
+                            sequence=new_sequence,
+                            acoustic_score=acoustic,
+                            lm_logprob=lm_logprob,
+                            length_norm=length_norm,
+                            search_score=search_score,
+                            fused_score=fused_score,
+                            source_index=idx,
+                            lm_entry=entry,
+                        )
+                        candidates_per_audio[i].append(candidate)
 
-        tokens = torch.tensor(next_tokens, device=tokens.device)
-        self.inference.rearrange_kv_cache(source_indices)
+            ranked = sorted(
+                candidates_per_audio[i],
+                key=lambda cand: cand.search_score,
+                reverse=True,
+            )
+            selected = ranked[: self.beam_size]
+            if not selected and candidates_per_audio[i]:
+                best = candidates_per_audio[i][0]
+                selected = [best] * self.beam_size
+            elif not selected:
+                base_idx = i * self.beam_size
+                selected = []
+                for j in range(self.beam_size):
+                    prev_sequence = current_sequences[base_idx + j]
+                    prev_entry = (
+                        self._lm_entries[base_idx + j]
+                        if self._lm_entries is not None
+                        else None
+                    )
+                    prev_lm = prev_entry.log_prob if prev_entry is not None else 0.0
+                    prev_acoustic = sum_logprobs[base_idx + j].item()
+                    prev_length = self._length_norm(len(prev_sequence), i)
+                    selected.append(
+                        BeamCandidate(
+                            sequence=prev_sequence,
+                            acoustic_score=prev_acoustic,
+                            lm_logprob=prev_lm,
+                            length_norm=prev_length,
+                            search_score=self._compose_total(
+                                prev_acoustic,
+                                prev_lm,
+                                prev_length,
+                                include_lm=use_lm_online,
+                            ),
+                            fused_score=self._compose_total(
+                                prev_acoustic,
+                                prev_lm,
+                                prev_length,
+                                include_lm=include_lm_final,
+                            ),
+                            source_index=base_idx + j,
+                            lm_entry=prev_entry,
+                        )
+                    )
+            if len(selected) < self.beam_size:
+                selected = (selected + [selected[-1]])[: self.beam_size]
+            selected_per_audio.append(selected)
+            for cand in selected:
+                next_tokens.append(cand.sequence)
+                next_acoustic.append(cand.acoustic_score)
+                source_indices.append(cand.source_index)
 
-        # add newly finished sequences to self.finished_sequences
-        assert len(self.finished_sequences) == len(finished_sequences)
-        for previously_finished, newly_finished in zip(
-            self.finished_sequences, finished_sequences
-        ):
-            for seq in sorted(newly_finished, key=newly_finished.get, reverse=True):
-                if len(previously_finished) >= self.max_candidates:
-                    break  # the candidate list is full
-                previously_finished[seq] = newly_finished[seq]
+        if next_tokens:
+            tokens = torch.tensor(next_tokens, device=tokens.device)
+            self.inference.rearrange_kv_cache(source_indices)
+            if sum_logprobs.numel() != len(next_acoustic):
+                sum_logprobs.resize_(len(next_acoustic))
+            sum_logprobs.copy_(torch.tensor(next_acoustic, device=sum_logprobs.device))
+            if self._lm_entries is not None:
+                self._lm_entries = [
+                    cand.lm_entry for group in selected_per_audio for cand in group
+                ]
+        else:
+            tokens = tokens.clone()
 
-        # mark as completed if all audio has enough number of samples
         completed = all(
             len(sequences) >= self.max_candidates
             for sequences in self.finished_sequences
@@ -402,26 +558,92 @@ class BeamSearchDecoder(TokenDecoder):
         return tokens, completed
 
     def finalize(self, preceding_tokens: Tensor, sum_logprobs: Tensor):
-        # collect all finished sequences, including patience, and add unfinished ones if not enough
-        sum_logprobs = sum_logprobs.cpu()
-        for i, sequences in enumerate(self.finished_sequences):
-            if (
-                len(sequences) < self.beam_size
-            ):  # when not enough sequences are finished
-                for j in list(np.argsort(sum_logprobs[i]))[::-1]:
-                    sequence = preceding_tokens[i, j].tolist() + [self.eot]
-                    sequences[tuple(sequence)] = sum_logprobs[i][j].item()
-                    if len(sequences) >= self.beam_size:
-                        break
+        if self.finished_sequences is None:
+            raise RuntimeError("BeamSearchDecoder.finalize called before update().")
 
-        tokens: List[List[Tensor]] = [
-            [torch.tensor(seq) for seq in sequences.keys()]
-            for sequences in self.finished_sequences
-        ]
-        sum_logprobs: List[List[float]] = [
-            list(sequences.values()) for sequences in self.finished_sequences
-        ]
-        return tokens, sum_logprobs
+        sum_logprobs = sum_logprobs.cpu()
+        n_audio = preceding_tokens.shape[0]
+
+        for i in range(n_audio):
+            sequences = self.finished_sequences[i]
+            if len(sequences) >= self.beam_size:
+                continue
+
+            for j in list(np.argsort(sum_logprobs[i]))[::-1]:
+                prefix = preceding_tokens[i, j].tolist()
+                sequence = tuple(prefix + [self.eot])
+                acoustic = sum_logprobs[i][j].item()
+                length_norm = self._length_norm(len(sequence), i)
+                lm_logprob = 0.0
+                lm_entry = None
+                if (
+                    self.lm_scorer is not None
+                    and self._lm_entries is not None
+                    and (i * self.beam_size + j) < len(self._lm_entries)
+                ):
+                    lm_entry = self.lm_scorer.finalize_entry(
+                        self._lm_entries[i * self.beam_size + j]
+                    )
+                    lm_logprob = lm_entry.log_prob
+
+                candidate = BeamCandidate(
+                    sequence=sequence,
+                    acoustic_score=acoustic,
+                    lm_logprob=lm_logprob,
+                    length_norm=length_norm,
+                    search_score=self._compose_total(
+                        acoustic, lm_logprob, length_norm, include_lm=False
+                    ),
+                    fused_score=self._compose_total(
+                        acoustic,
+                        lm_logprob,
+                        length_norm,
+                        include_lm=self.lm_weight > 0.0,
+                    ),
+                    source_index=i * self.beam_size + j,
+                    lm_entry=lm_entry,
+                )
+                self._insert_finished(i, candidate)
+                if len(self.finished_sequences[i]) >= self.beam_size:
+                    break
+
+        tokens: List[List[Tensor]] = []
+        sum_scores: List[List[float]] = []
+        for sequences in self.finished_sequences:
+            ranked = sorted(sequences.values(), key=lambda c: c.fused_score, reverse=True)
+            tokens.append([torch.tensor(seq.sequence) for seq in ranked[: self.beam_size]])
+            sum_scores.append([seq.fused_score for seq in ranked[: self.beam_size]])
+        return tokens, sum_scores
+
+    def _insert_finished(self, audio_idx: int, candidate: BeamCandidate) -> None:
+        assert self.finished_sequences is not None
+        finished = self.finished_sequences[audio_idx]
+        finished[candidate.sequence] = candidate
+        if len(finished) > self.max_candidates:
+            worst_key = min(finished, key=lambda key: finished[key].fused_score)
+            finished.pop(worst_key)
+
+    def _length_norm(self, seq_len: int, audio_idx: int) -> float:
+        if not self._prompt_lengths:
+            return float(seq_len)
+        base = self._prompt_lengths[audio_idx]
+        effective = max(seq_len - base, 1)
+        if self.length_exponent == 1.0:
+            return float(effective)
+        return float(effective) ** self.length_exponent
+
+    def _compose_total(
+        self,
+        acoustic: float,
+        lm_logprob: float,
+        length_norm: float,
+        *,
+        include_lm: bool,
+    ) -> float:
+        total = acoustic + self.length_weight * length_norm
+        if include_lm and self.lm_weight != 0.0:
+            total += self.lm_weight * lm_logprob
+        return total
 
 
 class LogitFilter:

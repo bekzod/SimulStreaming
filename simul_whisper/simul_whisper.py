@@ -2,6 +2,7 @@
 
 import os
 import logging
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -140,9 +141,19 @@ class PaddedAlignAttWhisper:
             self.inference.kv_cache = self.kv_cache
 
             lm_scorer = None
-            if cfg.kenlm_path and cfg.lm_weight and cfg.lm_weight > 0.0:
+            use_lm = cfg.kenlm_path and (
+                (cfg.lm_weight is not None and cfg.lm_weight > 0.0)
+                or cfg.lm_fusion_mode in {"rescore", "both"}
+            )
+            if use_lm:
                 try:
-                    lm_scorer = KenLMScorer(cfg.kenlm_path, lowercase=cfg.lm_lowercase)
+                    lm_scorer = KenLMScorer(
+                        cfg.kenlm_path,
+                        lowercase=cfg.lm_lowercase,
+                        tokenizer=self.tokenizer,
+                        token_mode=cfg.lm_token_mode,
+                        cache_max_size=cfg.lm_cache_size,
+                    )
                     logger.info("KenLM loaded for shallow fusion")
                 except Exception as e:
                     logger.warning(f"KenLM could not be initialized: {e}. Proceeding without LM.")
@@ -158,6 +169,9 @@ class PaddedAlignAttWhisper:
                 lm_scorer=lm_scorer,
                 lm_weight=(cfg.lm_weight or 0.0),
                 decode_tokens_to_text=_decode_tokens_to_text,
+                length_weight=cfg.lm_length_weight,
+                length_exponent=cfg.lm_length_exponent,
+                fusion_mode=cfg.lm_fusion_mode,
             )
 
     def create_tokenizer(self, language=None):
@@ -271,6 +285,26 @@ class PaddedAlignAttWhisper:
     def debug_print_tokens(self, tokens):
         for i in range(self.cfg.beam_size):
             logger.debug(self.tokenizer.decode_with_timestamps(tokens[i].tolist()))
+
+    def _best_finished_beam(self, device: torch.device) -> Optional[torch.Tensor]:
+        if self.decoder_type != "beam":
+            return None
+        finished = getattr(self.token_decoder, "finished_sequences", None)
+        if not finished:
+            return None
+        # In streaming we operate on single audio (index 0)
+        top_finished = finished[0] if finished else {}
+        if not top_finished:
+            return None
+        best_candidate = None
+        for candidate in top_finished.values():
+            if best_candidate is None or candidate.fused_score > best_candidate.fused_score:
+                best_candidate = candidate
+        if best_candidate is None:
+            return None
+        seq = list(best_candidate.sequence)
+        beam = torch.tensor([seq] * self.cfg.beam_size, device=device, dtype=torch.long)
+        return beam
 
     ### audio buffer 
 
@@ -524,7 +558,9 @@ class PaddedAlignAttWhisper:
             generation_progress.append(dict(generation_progress_loop))
             logger.debug("current tokens" + str(current_tokens.shape))
             if completed:
-            #    # stripping the last token, the eot
+                best_beam = self._best_finished_beam(current_tokens.device)
+                if best_beam is not None:
+                    current_tokens = best_beam
                 current_tokens = current_tokens[:, :-1]
                 break
             

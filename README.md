@@ -128,6 +128,32 @@ Simulation modes:
 
 - offline mode, to process whole audio with maximum quality, is not available yet. Instead, try large `--min-chunk-size` and `--frame-threshold`.
 
+#### KenLM shallow fusion
+
+Beam search integrates KenLM via shallow fusion with the scoring formula
+
+```
+score = logP_acoustic + α · logP_KenLM + β · len_norm
+```
+
+`--lm_weight` sets the LM weight α. Length normalisation is controlled by
+`--lm_length_weight` (β) and `--lm_length_exponent`. The decoder keeps the KenLM
+state per beam so prefixes are scored incrementally; tune the cache budget with
+`--lm_cache_size`.
+
+- `--lm_token_mode` chooses how prefixes are sent to KenLM.  `auto` reuses the
+  Whisper tokenizer; switch to `word` when using a word-level LM (whitespace and
+  punctuation are buffered safely). `subword` assumes the LM was trained on the
+  same subword vocabulary.
+- `--lm_fusion_mode` controls when KenLM is applied: `online` (default) mixes LM
+  scores during beam expansion, `rescore` keeps streaming acoustic-only and
+  rescored segments once they are emitted, and `both` performs both steps.
+- `--lm_lowercase` lowercases text prior to KenLM scoring when the LM expects
+  lowercase input.
+
+For latency-sensitive setups start with a small beam (3–5) and consider
+`--lm_fusion_mode rescore` to recover quality with post-segment rescoring.
+
 
 ### Server -- real-time from mic 
 
@@ -213,4 +239,3 @@ Before a pull request will be merged, contributors will be kindly asked to agree
 ## ✉️ Contact
 
 [Dominik Macháček](https://ufal.mff.cuni.cz/dominik-machacek/), machacek@ufal.mff.cuni.cz
-
