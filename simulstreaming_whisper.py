@@ -18,6 +18,10 @@ def simulwhisper_args(parser):
     group.add_argument("--decoder",type=str, default=None, help="Override automatic selection of beam or greedy decoder. "
                         "If beams > 1 and greedy: invalid.")
 
+    group.add_argument("--kenlm_path", type=str, default=None, help="Path to KenLM .arpa or binary model for shallow fusion (beam only)")
+    group.add_argument("--lm_weight", type=float, default=0.0, help="LM shallow fusion weight; 0 disables")
+    group.add_argument("--lm_lowercase", action=argparse.BooleanOptionalAction, default=False, help="Lowercase text before LM scoring")
+
     group = parser.add_argument_group('Audio buffer')
     group.add_argument('--audio_max_len', type=float, default=30.0, 
                         help='Max length of the audio buffer, in seconds.')
@@ -67,7 +71,8 @@ def simul_asr_factory(args):
         # else: it is greedy or beam, that's ok 
     
     a = { v:getattr(args, v) for v in ["model_path", "cif_ckpt_path", "frame_threshold", "audio_min_len", "audio_max_len", "beams", "task",
-                                       "never_fire", 'init_prompt', 'static_init_prompt', 'max_context_tokens', "logdir"
+                                       "never_fire", 'init_prompt', 'static_init_prompt', 'max_context_tokens', "logdir",
+                                       "kenlm_path", "lm_weight", "lm_lowercase"
                                        ]}
     a["language"] = args.lan
     a["segment_length"] = args.min_chunk_size

@@ -306,6 +306,10 @@ class BeamSearchDecoder(TokenDecoder):
         eot: int,
         inference: Inference,
         patience: Optional[float] = None,
+        # optional shallow-fusion LM support
+        lm_scorer: Optional[object] = None,
+        lm_weight: float = 0.0,
+        decode_tokens_to_text=None,
     ):
         self.beam_size = beam_size
         self.eot = eot
@@ -313,6 +317,10 @@ class BeamSearchDecoder(TokenDecoder):
         self.patience = patience or 1.0
         self.max_candidates: int = round(beam_size * self.patience)
         self.finished_sequences = None
+        # LM fusion
+        self.lm_scorer = lm_scorer
+        self.lm_weight = lm_weight or 0.0
+        self.decode_tokens_to_text = decode_tokens_to_text
 
         assert (
             self.max_candidates > 0
@@ -341,9 +349,19 @@ class BeamSearchDecoder(TokenDecoder):
                 idx = i * self.beam_size + j
                 prefix = tokens[idx].tolist()
                 for logprob, token in zip(*logprobs[idx].topk(self.beam_size + 1)):
-                    new_logprob = (sum_logprobs[idx] + logprob).item()
+                    acoustic = (sum_logprobs[idx] + logprob).item()
                     sequence = tuple(prefix + [token.item()])
-                    scores[sequence] = new_logprob
+                    fused = acoustic
+                    # optional LM shallow fusion on the candidate
+                    if self.lm_scorer is not None and self.lm_weight > 0.0 and self.decode_tokens_to_text is not None:
+                        try:
+                            text = self.decode_tokens_to_text(list(sequence))
+                            lm = self.lm_scorer.score_text(text, add_bos=True, add_eos=False)
+                            fused = acoustic + self.lm_weight * lm
+                        except Exception:
+                            # be robust; fall back to acoustic only if LM scoring fails
+                            fused = acoustic
+                    scores[sequence] = fused
                     sources[sequence] = idx
 
             # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
@@ -352,7 +370,8 @@ class BeamSearchDecoder(TokenDecoder):
                 if sequence[-1] == self.eot:
                     finished[sequence] = scores[sequence]
                 else:
-                    sum_logprobs[len(next_tokens)] = scores[sequence]
+                    # keep acoustic-only cumulative for future acoustic accumulation
+                    sum_logprobs[len(next_tokens)] = acoustic
                     next_tokens.append(sequence)
                     source_indices.append(sources[sequence])
 

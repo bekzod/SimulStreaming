@@ -13,6 +13,7 @@ from .whisper.timing import median_filter
 from .whisper.decoding import GreedyDecoder, BeamSearchDecoder, SuppressTokens, detect_language
 from .beam import BeamPyTorchInference
 from .eow_detection import fire_at_boundary, load_cif
+from .kenlm_scorer import KenLMScorer
 import os
 
 from token_buffer import TokenBuffer
@@ -138,7 +139,26 @@ class PaddedAlignAttWhisper:
             self.inference = BeamPyTorchInference(self.model, self.initial_token_length)
             self.inference.kv_cache = self.kv_cache
 
-            self.token_decoder = BeamSearchDecoder(inference=self.inference, eot=self.tokenizer.eot, beam_size=cfg.beam_size)
+            lm_scorer = None
+            if cfg.kenlm_path and cfg.lm_weight and cfg.lm_weight > 0.0:
+                try:
+                    lm_scorer = KenLMScorer(cfg.kenlm_path, lowercase=cfg.lm_lowercase)
+                    logger.info("KenLM loaded for shallow fusion")
+                except Exception as e:
+                    logger.warning(f"KenLM could not be initialized: {e}. Proceeding without LM.")
+
+            # decode callback
+            def _decode_tokens_to_text(token_ids) -> str:
+                return self.tokenizer.decode(token_ids)
+
+            self.token_decoder = BeamSearchDecoder(
+                inference=self.inference,
+                eot=self.tokenizer.eot,
+                beam_size=cfg.beam_size,
+                lm_scorer=lm_scorer,
+                lm_weight=(cfg.lm_weight or 0.0),
+                decode_tokens_to_text=_decode_tokens_to_text,
+            )
 
     def create_tokenizer(self, language=None):
         self.tokenizer = tokenizer.get_tokenizer(

@@ -17,6 +17,11 @@ class SimulWhisperConfig:
     static_init_prompt: str = field(default=None)
     max_context_tokens: int = field(default=None)
 
+    # External LM (KenLM) shallow fusion
+    kenlm_path: str = field(default=None, metadata={"help": "Path to KenLM .arpa or binary model"})
+    lm_weight: float = field(default=0.0, metadata={"help": "Weight for LM shallow fusion (0 disables)"})
+    lm_lowercase: bool = field(default=False, metadata={"help": "Lowercase text before LM scoring"})
+
     logdir: str = field(default="logdir", metadata={"help": "Directory to save audio segments and tokens for debugging purposes."})
 
 @dataclass
